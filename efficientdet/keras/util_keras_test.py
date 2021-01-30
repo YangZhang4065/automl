@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2020 Google Research. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,31 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for Autoaugment."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-from absl import logging
-import tensorflow.compat.v1 as tf
-
-from aug import autoaugment
+import tensorflow as tf
+import utils
+from keras import utils_keras
+from absl.testing import parameterized
 
 
-class AutoaugmentTest(tf.test.TestCase):
+class KerasUtilTest(tf.test.TestCase, parameterized.TestCase):
 
-  def test_autoaugment_policy(self):
-    # A very simple test to verify no syntax error.
-    image = tf.placeholder(tf.uint8, shape=[640, 640, 3])
-    bboxes = tf.placeholder(tf.float32, shape=[4, 4])
-    autoaugment.distort_image_with_autoaugment(image, bboxes, 'test')
-    autoaugment.distort_image_with_autoaugment(
-        image, bboxes, 'test', use_augmix=True)
+  @parameterized.parameters(
+      (True),
+      (False),
+  )
+  def test_batch_normalization(self, is_training_bn):
+    inputs = tf.random.uniform([8, 40, 40, 3])
+    with self.subTest(is_training_bn=is_training_bn):
+      expect_results = utils.batch_norm_act(inputs, is_training_bn, None)
+      tf.keras.backend.set_learning_phase(int(is_training_bn))
+      actual_results = utils_keras.batch_normalization(is_training_bn)(inputs)
+      self.assertAllEqual(expect_results, actual_results)
 
 
 if __name__ == '__main__':
-  logging.set_verbosity(logging.WARNING)
-  tf.disable_eager_execution()
   tf.test.main()
-

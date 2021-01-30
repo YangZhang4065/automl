@@ -20,11 +20,11 @@ from __future__ import print_function
 
 import os
 
+from absl import app
 from absl import flags
 from absl import logging
 
 import numpy as np
-import tensorflow.compat.v1 as tf
 
 import dataloader
 import det_model_fn
@@ -52,11 +52,12 @@ flags.DEFINE_string(
     'eval_master', default='',
     help='GRPC URL of the eval master. Set to an appropriate value when running'
     ' on CPU/GPU')
-flags.DEFINE_bool('use_tpu', True, 'Use TPUs rather than CPUs/GPUs')
+flags.DEFINE_string('strategy', 'tpu', 'Use TPUs rather than CPUs/GPUs')
 flags.DEFINE_bool('use_fake_data', False, 'Use fake input.')
 flags.DEFINE_bool(
     'use_xla', False,
-    'Use XLA even if use_tpu is false.  If use_tpu is true, we always use XLA, '
+    'Use XLA even if strategy is not tpu. '
+    'If strategy is tpu, we always use XLA, '
     'and this flag has no effect.')
 flags.DEFINE_string('model_dir', None, 'Location of model_dir')
 flags.DEFINE_string('backbone_ckpt', '',
@@ -119,12 +120,17 @@ flags.DEFINE_integer(
 FLAGS = flags.FLAGS
 
 
-def main(argv):
-  assert len(argv) >= 1
-  if len(argv) > 1:  # Do not accept unknown args.
-    raise ValueError('Received unknown arguments: {}'.format(argv[1:]))
+def main(_):
 
-  if FLAGS.use_tpu:
+  if FLAGS.strategy == 'horovod':
+    import horovod.tensorflow as hvd  # pylint: disable=g-import-not-at-top
+    logging.info('Use horovod with multi gpus')
+    hvd.init()
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(hvd.local_rank())
+  import tensorflow.compat.v1 as tf  # pylint: disable=g-import-not-at-top
+  tf.disable_eager_execution()
+
+  if FLAGS.strategy == 'tpu':
     tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
         FLAGS.tpu,
         zone=FLAGS.tpu_zone,
@@ -216,16 +222,16 @@ def main(argv):
       model_dir=FLAGS.model_dir,
       num_shards=num_shards,
       num_examples_per_epoch=FLAGS.num_examples_per_epoch,
-      use_tpu=FLAGS.use_tpu,
+      strategy=FLAGS.strategy,
       backbone_ckpt=FLAGS.backbone_ckpt,
       ckpt=FLAGS.ckpt,
       val_json_file=FLAGS.val_json_file,
       testdev_dir=FLAGS.testdev_dir,
-      mode=FLAGS.mode,
+      mode=FLAGS.mode
   )
   config_proto = tf.ConfigProto(
       allow_soft_placement=True, log_device_placement=False)
-  if FLAGS.use_xla and not FLAGS.use_tpu:
+  if FLAGS.use_xla and FLAGS.strategy != 'tpu':
     config_proto.graph_options.optimizer_options.global_jit_level = (
         tf.OptimizerOptions.ON_1)
 
@@ -237,10 +243,15 @@ def main(argv):
       per_host_input_for_training=tf.estimator.tpu.InputPipelineConfig
       .PER_HOST_V2)
 
+  if FLAGS.strategy == 'horovod':
+    model_dir = FLAGS.model_dir if hvd.rank() == 0 else None
+  else:
+    model_dir = FLAGS.model_dir
+
   run_config = tf.estimator.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       evaluation_master=FLAGS.eval_master,
-      model_dir=FLAGS.model_dir,
+      model_dir=model_dir,
       log_step_count_steps=FLAGS.iterations_per_loop,
       session_config=config_proto,
       tpu_config=tpu_config,
@@ -254,7 +265,7 @@ def main(argv):
   if FLAGS.mode == 'train':
     train_estimator = tf.estimator.tpu.TPUEstimator(
         model_fn=model_fn_instance,
-        use_tpu=FLAGS.use_tpu,
+        use_tpu=FLAGS.strategy == 'tpu',
         train_batch_size=FLAGS.train_batch_size,
         config=run_config,
         params=params)
@@ -269,14 +280,14 @@ def main(argv):
       # Run evaluation after training finishes.
       eval_params = dict(
           params,
-          use_tpu=FLAGS.use_tpu,
+          strategy=FLAGS.strategy,
           input_rand_hflip=False,
           is_training_bn=False,
           precision=None,
       )
       eval_estimator = tf.estimator.tpu.TPUEstimator(
           model_fn=model_fn_instance,
-          use_tpu=FLAGS.use_tpu,
+          use_tpu=FLAGS.strategy == 'tpu',
           train_batch_size=FLAGS.train_batch_size,
           eval_batch_size=FLAGS.eval_batch_size,
           config=run_config,
@@ -290,12 +301,11 @@ def main(argv):
       utils.archive_ckpt(eval_results, eval_results['AP'], ckpt)
 
   elif FLAGS.mode == 'eval':
-    # Eval only runs on CPU or GPU host with batch_size = 1.
     # Override the default options: disable randomization in the input pipeline
     # and don't run on the TPU.
     eval_params = dict(
         params,
-        use_tpu=FLAGS.use_tpu,
+        strategy=FLAGS.strategy,
         input_rand_hflip=False,
         is_training_bn=False,
         precision=None,
@@ -303,7 +313,7 @@ def main(argv):
 
     eval_estimator = tf.estimator.tpu.TPUEstimator(
         model_fn=model_fn_instance,
-        use_tpu=FLAGS.use_tpu,
+        use_tpu=FLAGS.strategy == 'tpu',
         train_batch_size=FLAGS.train_batch_size,
         eval_batch_size=FLAGS.eval_batch_size,
         config=run_config,
@@ -357,7 +367,7 @@ def main(argv):
       logging.info('Starting training cycle, epoch: %d.', cycle)
       train_estimator = tf.estimator.tpu.TPUEstimator(
           model_fn=model_fn_instance,
-          use_tpu=FLAGS.use_tpu,
+          use_tpu=FLAGS.strategy == 'tpu',
           train_batch_size=FLAGS.train_batch_size,
           config=run_config,
           params=params)
@@ -371,14 +381,14 @@ def main(argv):
       # Run evaluation after every epoch.
       eval_params = dict(
           params,
-          use_tpu=FLAGS.use_tpu,
+          strategy=FLAGS.strategy,
           input_rand_hflip=False,
           is_training_bn=False,
       )
 
       eval_estimator = tf.estimator.tpu.TPUEstimator(
           model_fn=model_fn_instance,
-          use_tpu=FLAGS.use_tpu,
+          use_tpu=FLAGS.strategy == 'tpu',
           train_batch_size=FLAGS.train_batch_size,
           eval_batch_size=FLAGS.eval_batch_size,
           config=run_config,
@@ -396,5 +406,5 @@ def main(argv):
 
 
 if __name__ == '__main__':
-  tf.disable_eager_execution()
-  tf.app.run(main)
+  logging.set_verbosity(logging.WARNING)
+  app.run(main)

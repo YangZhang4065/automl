@@ -37,9 +37,9 @@ _DEFAULT_BATCH_SIZE = 64
 
 def update_learning_rate_schedule_parameters(params):
   """Updates params that are related to the learning rate schedule."""
-  # params['batch_size'] is per-shard within model_fn if use_tpu=true.
-  batch_size = (params['batch_size'] * params['num_shards'] if params['use_tpu']
-                else params['batch_size'])
+  # params['batch_size'] is per-shard within model_fn if strategy=tpu.
+  batch_size = (params['batch_size'] * params['num_shards']
+                if params['strategy'] == 'tpu' else params['batch_size'])
   # Learning rate is proportional to the batch size
   params['adjusted_learning_rate'] = (params['learning_rate'] * batch_size /
                                       _DEFAULT_BATCH_SIZE)
@@ -375,7 +375,8 @@ def add_metric_fn_inputs(params,
   else:
     # Keep all anchors, but for each anchor, just keep the max probablity for
     # each class.
-    cls_outputs_idx = tf.math.argmax(cls_outputs_all, axis=-1)
+    cls_outputs_idx = tf.math.argmax(
+        cls_outputs_all, axis=-1, output_type=tf.int32)
     num_anchors = cls_outputs_all.shape[1]
 
     classes = cls_outputs_idx
@@ -452,6 +453,7 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
     RuntimeError: if both ckpt and backbone_ckpt are set.
   """
   # Convert params (dict) to Config for easier access.
+  training_hooks = None
   if params['data_format'] == 'channels_first':
     features = tf.transpose(features, [0, 3, 1, 2])
   def _model_outputs(inputs):
@@ -483,8 +485,8 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
   # cls_loss and box_loss are for logging. only total_loss is optimized.
   det_loss, cls_loss, box_loss, box_iou_loss = detection_loss(
       cls_outputs, box_outputs, labels, params)
-  l2loss = reg_l2_loss(params['weight_decay'])
-  total_loss = det_loss + l2loss
+  reg_l2loss = reg_l2_loss(params['weight_decay'])
+  total_loss = det_loss + reg_l2loss
 
   if mode == tf.estimator.ModeKeys.TRAIN:
     utils.scalar('lrn_rate', learning_rate)
@@ -492,7 +494,7 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
     utils.scalar('trainloss/box_loss', box_loss)
     utils.scalar('trainloss/box_iou_loss', box_iou_loss)
     utils.scalar('trainloss/det_loss', det_loss)
-    utils.scalar('trainloss/l2_loss', l2loss)
+    utils.scalar('trainloss/reg_l2_loss', reg_l2loss)
     utils.scalar('trainloss/loss', total_loss)
 
   moving_average_decay = params['moving_average_decay']
@@ -500,12 +502,23 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
     ema = tf.train.ExponentialMovingAverage(
         decay=moving_average_decay, num_updates=global_step)
     ema_vars = utils.get_ema_vars()
-
+  if params['strategy'] == 'horovod':
+    import horovod.tensorflow as hvd   # pylint: disable=g-import-not-at-top
+    learning_rate = learning_rate * hvd.size()
   if mode == tf.estimator.ModeKeys.TRAIN:
-    optimizer = tf.train.MomentumOptimizer(
-        learning_rate, momentum=params['momentum'])
-    if params['use_tpu']:
+    if params['optimizer'].lower() == 'sgd':
+      optimizer = tf.train.MomentumOptimizer(
+          learning_rate, momentum=params['momentum'])
+    elif params['optimizer'].lower() == 'adam':
+      optimizer = tf.train.AdamOptimizer(
+          learning_rate)
+    else:
+      raise ValueError('optimizers should be adam or sgd')
+    if params['strategy'] == 'tpu':
       optimizer = tf.tpu.CrossShardOptimizer(optimizer)
+    elif params['strategy'] == 'horovod':
+      optimizer = hvd.DistributedOptimizer(optimizer)
+      training_hooks = [hvd.BroadcastGlobalVariablesHook(0)]
 
     # Batch norm requires update_ops to be added as a train_op dependency.
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
@@ -543,7 +556,7 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
     def metric_fn(**kwargs):
       """Returns a dictionary that has the evaluation metrics."""
       batch_size = params['batch_size']
-      if params['use_tpu']:
+      if params['strategy'] == 'tpu':
         batch_size = params['batch_size'] * params['num_shards']
       eval_anchors = anchors.Anchors(params['min_level'],
                                      params['max_level'],
@@ -642,7 +655,8 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
       train_op=train_op,
       eval_metrics=eval_metrics,
       host_call=utils.get_tpu_host_call(global_step, params),
-      scaffold_fn=scaffold_fn)
+      scaffold_fn=scaffold_fn,
+      training_hooks=training_hooks)
 
 
 def retinanet_model_fn(features, labels, mode, params):
